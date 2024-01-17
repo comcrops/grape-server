@@ -1,10 +1,12 @@
 use rocket::response::content;
 use rocket::serde::json::Json;
 use rocket::serde::Deserialize;
+use rocket::time::PrimitiveDateTime;
 use rocket::State;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use url::Url;
+use time::OffsetDateTime;
+use sha2::{Sha256, Digest};
 
 #[macro_use]
 extern crate rocket;
@@ -15,27 +17,14 @@ struct AddData {
     text: String,
     password: Option<String>,
     url: Option<String>,
-    /// Unix timestamp
-    expires_at: Option<i32>,
+    expiring_date: Option<OffsetDateTime>,
 }
 
 #[rocket::main]
 async fn main() -> Result<(), rocket::Error> {
     dotenv::dotenv().expect("Failed to load .env file");
 
-    let db_url = format!(
-        "postgres://{}:{}/{}",
-        dotenv::var("DB_HOST").expect("Failed to get DB_HOST"),
-        dotenv::var("DB_PORT").expect("Failed to get DB_PORT"),
-        dotenv::var("DB_NAME").expect("Failed to get DB_NAME")
-    );
-    let mut db_url = Url::parse(&db_url).expect("Failed to parse database URL");
-    db_url
-        .set_username(&dotenv::var("DB_USER").expect("Failed to get DB_USER"))
-        .expect("Failed to set username");
-    db_url
-        .set_password(Some(&dotenv::var("DB_PWD").expect("Failed to get DB_PWD")))
-        .expect("Failed to set password");
+    let db_url = dotenv::var("DATABASE_URL").expect("DATABASE_URL not set");
 
     let db_pool = PgPoolOptions::new()
         .connect(db_url.as_str())
@@ -56,20 +45,45 @@ async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> content::RawHtm
     let body = body.0;
 
     dbg!(&body);
+    let expiring_date = match body.expiring_date {
+        Some(date) => Some(PrimitiveDateTime::new(date.date(), date.time())),
+        None => None,
+    };
 
-    sqlx::query("INSERT INTO grape (text, password, url, expires_at) VALUES ($1, $2, $3, $4)")
-        .bind(&body.text)
-        .bind(&body.password)
-        .bind(&body.url)
-        .bind(&body.expires_at)
-        .execute(&**db)
-        .await
-        .expect("Failed to insert into database");
+    let url = match body.url {
+        Some(url) => url,
+        None => uuid::Uuid::new_v4().to_string(),
+    };
 
-    todo!()
+    let password = hash_password(body.password);
+
+    sqlx::query!(
+        r#"INSERT INTO paste (text, password, url, expires_at) VALUES ($1, $2, $3, $4)"#,
+        body.text,
+        password,
+        url,
+        expiring_date
+    )
+    .execute(&**db)
+    .await
+    .expect("Failed to insert into database");
+
+    content::RawHtml(url)
 }
 
-#[get("/<id>")]
-fn get(id: &str) -> content::RawHtml<String> {
-    todo!()
+#[get("/<url>")]
+async fn get(url: &str, db: &State<Pool<Postgres>>) -> content::RawHtml<String> {
+    let paste = sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
+        .fetch_one(&**db)
+        .await
+        .expect("Failed to fetch from database");
+
+    content::RawHtml(paste.text)
+}
+
+fn hash_password(password: Option<String>) -> Option<String> {
+    match password {
+        Some(password) => Some(format!("{:X}", Sha256::digest(password))),
+        None => None,
+    }
 }
