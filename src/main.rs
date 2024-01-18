@@ -47,16 +47,12 @@ async fn main() -> Result<(), rocket::Error> {
 async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> content::RawHtml<String> {
     let body = body.0;
 
-    dbg!(&body);
     let expiring_date = match body.expiring_date {
         Some(date) => Some(PrimitiveDateTime::new(date.date(), date.time())),
         None => None,
     };
 
-    let url = match body.url {
-        Some(url) => url,
-        None => uuid::Uuid::new_v4().to_string(),
-    };
+    let url = body.url.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let mut nonce: Option<Vec<u8>> = None;
     let mut text = body.text.as_bytes().to_vec();
@@ -96,7 +92,10 @@ async fn get(url: &str, db: &State<Pool<Postgres>>) -> content::RawHtml<String> 
 }
 
 fn encrypt_text(text: &str, password: &str) -> (Vec<u8>, Option<Vec<u8>>) {
-    let key = Key::<Aes256Gcm>::from_slice(password.as_bytes());
+    let key: &[u8] = password.as_bytes();
+    let zeros = vec![0; 32 - key.len()];
+    let key = [key, &zeros].concat();
+    let key = Key::<Aes256Gcm>::from_slice(&key);
     let cipher = Aes256Gcm::new(&key);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     (
