@@ -100,10 +100,12 @@ async fn get(url: &str, db: &State<Pool<Postgres>>) -> content::RawHtml<String> 
         let now = PrimitiveDateTime::new(now.date(), now.time());
 
         if expires_at < now {
-            sqlx::query!(r#"UPDATE paste SET text='', password=NULL, nonce=NULL, burn_after_read=false WHERE url=$1"#, url)
-                .execute(&**db)
-                .await
-                .expect(format!("Failed to delete content from expired entry: {}", url).as_str());
+            if paste.text.len() > 0 {
+                sqlx::query!(r#"UPDATE paste SET text='', password=NULL, nonce=NULL, burn_after_read=false WHERE url=$1"#, url)
+                    .execute(&**db)
+                    .await
+                    .expect(format!("Failed to delete content from expired entry: {}", url).as_str());
+            }
             return content::RawHtml("Paste has expired".to_string());
         }
     }
