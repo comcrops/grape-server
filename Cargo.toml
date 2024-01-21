@@ -17,4 +17,6 @@ sqlx = { version = "0.7.3", features = [
 ] }
 time = { version = "0.3.31", features = ["serde", "macros"] }
 url = "2.5.0"
+utoipa = { version = "4.2.0", features = ["rocket_extras", "time"] }
+utoipa-swagger-ui = { version = "6.0.0", features = ["rocket"] }
 uuid = { version = "1.6.1", features = ["v4"] }
