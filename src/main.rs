@@ -1,5 +1,3 @@
-use std::string::FromUtf8Error;
-
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit};
@@ -8,17 +6,16 @@ use rocket::response::content;
 use rocket::serde::json::Json;
 use rocket::serde::Deserialize;
 use rocket::time::PrimitiveDateTime;
-use rocket::State;
+use rocket::{State, Responder, post, routes, get};
 use rocket_cors::{CorsOptions, AllowedOrigins};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
 use time::OffsetDateTime;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
-#[macro_use]
-extern crate rocket;
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(crate = "rocket::serde")]
 struct AddData {
     text: String,
@@ -27,10 +24,63 @@ struct AddData {
     expiring_date: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Responder)]
+enum AddResponse {
+    #[response(status = 201, content_type = "json")]
+    Created { url: String },
+    #[response(status = 400)]
+    PasswordTooLong(&'static str),
+}
+
+#[derive(Responder)]
+enum GetResponse {
+    #[response(status = 200, content_type = "json")]
+    Ok { text: String },
+    #[response(status = 401)]
+    PasswordRequired(&'static str),
+    #[response(status = 404)]
+    NotFound(&'static str),
+    #[response(status = 500)]
+    DeletePasteError(String),
+    #[response(status = 500)]
+    ParseError(String),
+}
+
+#[derive(Responder)]
+enum GetWithPasswordResponse {
+    #[response(status = 200, content_type = "json")]
+    Ok { text: String },
+    #[response(status = 401)]
+    PasswordIncorrect(&'static str),
+    #[response(status = 404)]
+    NotFound(&'static str),
+    #[response(status = 500)]
+    DeletePasteError(String),
+    #[response(status = 500)]
+    ParseError(String),
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(crate = "rocket::serde")]
 struct PasswordBody {
     password: String,
+}
+
+#[derive(Debug)]
+struct DeletePasteError {
+    expired_url: String,
+}
+
+impl std::error::Error for DeletePasteError {}
+
+impl std::fmt::Display for DeletePasteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to delete text from expired paste: {}",
+            self.expired_url
+        )
+    }
 }
 
 #[rocket::main]
@@ -44,6 +94,22 @@ async fn main() -> Result<(), rocket::Error> {
         .await
         .expect("Failed to connect to database");
 
+    #[derive(OpenApi)]
+    #[openapi(
+        paths(
+            add,
+            get,
+            get_with_password,
+        ),
+        components(
+            schemas(
+                AddData,
+                PasswordBody,
+            ),
+        ),
+    )]
+    struct ApiDoc;
+
     let cors = CorsOptions::default()
         .allowed_origins(AllowedOrigins::all())
         .allowed_methods(
@@ -56,6 +122,9 @@ async fn main() -> Result<(), rocket::Error> {
 
     let _rocket = rocket::build()
         .manage(db_pool)
+        .mount("/", 
+            SwaggerUi::new("/docs/<_..>").url("/api/v1/openapi.json", ApiDoc::openapi())
+        )
         .mount("/api/v1", routes![add, get, get_with_password])
         .attach(cors.to_cors().unwrap())
         .launch()
@@ -64,8 +133,9 @@ async fn main() -> Result<(), rocket::Error> {
     Ok(())
 }
 
+#[utoipa::path(post, path = "/add")]
 #[post("/add", data = "<body>")]
-async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> content::RawHtml<String> {
+async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> AddResponse {
     let body = body.0;
 
     let expiring_date = match body.expiring_date {
@@ -81,7 +151,7 @@ async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> content::RawHtm
     if body.password.is_some() {
         let password = body.password.clone().unwrap();
         if password.len() > 32 {
-            return content::RawHtml("Password must not be longer than 32 characters".to_string());
+            return AddResponse::PasswordTooLong("Password is too long");
         }
 
         (text, nonce) = encrypt_text(&body.text, &password);
@@ -104,66 +174,78 @@ async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> content::RawHtm
     .await
     .expect("Failed to insert into database");
 
-    content::RawHtml(url)
+    AddResponse::Created { url }
 }
 
+#[utoipa::path(get, path = "/{url}")]
 #[get("/<url>")]
-async fn get(url: &str, db: &State<Pool<Postgres>>) -> content::RawHtml<String> {
-    let paste = sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
+async fn get(url: &str, db: &State<Pool<Postgres>>) -> GetResponse {
+    let paste = match sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
         .fetch_one(&**db)
         .await
-        .expect("Failed to fetch from database");
+    {
+        Ok(paste) => paste,
+        Err(_) => return GetResponse::NotFound("Paste not found"),
+    };
 
     if paste.expires_at.is_some() {
-        if let Some(expired_err) =
-            delete_paste_if_expired(paste.url, paste.expires_at.unwrap(), &paste.text, db).await
-        {
-            return expired_err;
+        match delete_paste_if_expired(paste.url, paste.expires_at.unwrap(), &paste.text, db).await {
+            Ok(_) => {}
+            Err(err) => return GetResponse::DeletePasteError(err.to_string()),
         }
     }
 
     if paste.password.is_some() {
-        return content::RawHtml("Paste is encrypted".to_string());
+        return GetResponse::PasswordRequired("Password is required");
     }
 
     match String::from_utf8(paste.text) {
-        Ok(text) => content::RawHtml(text),
-        Err(err) => content::RawHtml(err.to_string()),
+        Ok(text) => GetResponse::Ok { text },
+        Err(err) => GetResponse::ParseError(err.to_string()),
     }
 }
 
+#[utoipa::path(post, path = "/{url}")]
 #[post("/<url>", data = "<body>")]
 async fn get_with_password(
     url: &str,
     body: Json<PasswordBody>,
     db: &State<Pool<Postgres>>,
-) -> content::RawHtml<String> {
-    let paste = sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
+) -> GetWithPasswordResponse {
+    let paste = match sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
         .fetch_one(&**db)
         .await
-        .expect("Failed to fetch from database");
+    {
+        Ok(paste) => paste,
+        Err(_) => return GetWithPasswordResponse::NotFound("Paste not found"),
+    };
 
     if paste.expires_at.is_some() {
-        if let Some(expired_err) =
-            delete_paste_if_expired(paste.url, paste.expires_at.unwrap(), &paste.text, db).await
-        {
-            return expired_err;
+        match delete_paste_if_expired(paste.url, paste.expires_at.unwrap(), &paste.text, db).await {
+            Ok(_) => {}
+            Err(err) => return GetWithPasswordResponse::DeletePasteError(err.to_string()),
+        }
+    }
+
+    /// Defer would be so nice here
+    fn parse_text(text: Vec<u8>) -> GetWithPasswordResponse {
+        match String::from_utf8(text) {
+            Ok(text) => GetWithPasswordResponse::Ok { text },
+            Err(err) => GetWithPasswordResponse::ParseError(err.to_string()),
         }
     }
 
     if paste.password.is_none() {
-        return content::RawHtml("Paste is not encrypted".to_string());
+        return parse_text(paste.text);
     }
 
     let hashed_password = hash_password(&body.password.clone());
     if paste.password.unwrap() != hashed_password {
-        return content::RawHtml("Password is incorrect".to_string());
+        return GetWithPasswordResponse::PasswordIncorrect("Password is incorrect");
     }
 
-    match decrypt_text(&paste.text, &body.password, &paste.nonce.unwrap()) {
-        Ok(text) => content::RawHtml(text),
-        Err(err) => content::RawHtml(err.to_string()),
-    }
+    let text = decrypt_text(&paste.text, &body.password, &paste.nonce.unwrap());
+    parse_text(text)
 }
 
 async fn delete_paste_if_expired(
@@ -171,21 +253,25 @@ async fn delete_paste_if_expired(
     expires_at: PrimitiveDateTime,
     text: &Vec<u8>,
     db: &State<Pool<Postgres>>,
-) -> Option<content::RawHtml<String>> {
+) -> Result<(), DeletePasteError> {
     let now = OffsetDateTime::now_utc();
     let now = PrimitiveDateTime::new(now.date(), now.time());
 
     if expires_at < now {
         if text.len() > 0 {
-            sqlx::query!(r#"UPDATE paste SET text='', password=NULL, nonce=NULL, burn_after_read=false WHERE url=$1"#, url)
-                    .execute(&**db)
-                    .await
-                    .expect(format!("Failed to delete content from expired entry: {}", url).as_str());
+            let result = sqlx::query!(
+                r#"UPDATE paste SET text='', password=NULL, nonce=NULL, burn_after_read=false WHERE url=$1"#,
+                url
+            )
+                .execute(&**db)
+                .await;
+            if result.is_err() {
+                return Err(DeletePasteError { expired_url: url });
+            }
         }
-        return Some(content::RawHtml("Paste has expired".to_string()));
     }
 
-    None
+    Ok(())
 }
 
 fn encrypt_text(text: &str, password: &str) -> (Vec<u8>, Option<Vec<u8>>) {
@@ -200,18 +286,12 @@ fn encrypt_text(text: &str, password: &str) -> (Vec<u8>, Option<Vec<u8>>) {
     )
 }
 
-fn decrypt_text(
-    encrypted_text: &[u8],
-    password: &str,
-    nonce: &[u8],
-) -> Result<String, FromUtf8Error> {
+fn decrypt_text(encrypted_text: &[u8], password: &str, nonce: &[u8]) -> Vec<u8> {
     let cipher = generate_cipher_from_password(password);
 
-    String::from_utf8(
-        cipher
-            .decrypt(GenericArray::from_slice(&nonce), encrypted_text)
-            .expect("Can't fail since we don't use payload"),
-    )
+    cipher
+        .decrypt(GenericArray::from_slice(&nonce), encrypted_text)
+        .expect("Can't fail since we don't use payload")
 }
 
 fn generate_cipher_from_password(password: &str) -> Aes256Gcm {
