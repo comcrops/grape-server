@@ -3,11 +3,13 @@ use std::string::FromUtf8Error;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit};
+use rocket::http::Method;
 use rocket::response::content;
 use rocket::serde::json::Json;
 use rocket::serde::Deserialize;
 use rocket::time::PrimitiveDateTime;
 use rocket::State;
+use rocket_cors::{CorsOptions, AllowedOrigins};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
@@ -42,9 +44,20 @@ async fn main() -> Result<(), rocket::Error> {
         .await
         .expect("Failed to connect to database");
 
+    let cors = CorsOptions::default()
+        .allowed_origins(AllowedOrigins::all())
+        .allowed_methods(
+            vec![Method::Get, Method::Post, Method::Patch]
+                .into_iter()
+                .map(From::from)
+                .collect(),
+        )
+        .allow_credentials(true);
+
     let _rocket = rocket::build()
         .manage(db_pool)
         .mount("/api/v1", routes![add, get, get_with_password])
+        .attach(cors.to_cors().unwrap())
         .launch()
         .await?;
 
