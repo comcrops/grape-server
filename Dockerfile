@@ -6,6 +6,7 @@ COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./src ./src
 COPY .env ./.env
+COPY ./Rocket.toml ./Rocket.toml
 
 ARG DATABASE_URL
 ENV DATABASE_URL=$DATABASE_URL
