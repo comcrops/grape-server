@@ -1,2 +1,5 @@
 [release]
 address = "0.0.0.0"
+[release.tls]
+certs = "/ssl/cert.pem"
+key = "/ssl/key.pem"
