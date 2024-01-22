@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  websever:
+    build:
+      context: .
+      args:
+        DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - "8000:8000"
+    container_name: grape_server
+    environment:
+        DATABASE_URL: ${DATABASE_URL}
+    image: rust:latest
+

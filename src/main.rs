@@ -2,7 +2,6 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit};
 use rocket::http::Method;
-use rocket::response::content;
 use rocket::serde::json::Json;
 use rocket::serde::Deserialize;
 use rocket::time::PrimitiveDateTime;
@@ -122,7 +121,7 @@ async fn main() -> Result<(), rocket::Error> {
 
     let _rocket = rocket::build()
         .manage(db_pool)
-        .mount("/", 
+        .mount("/",
             SwaggerUi::new("/docs/<_..>").url("/api/v1/openapi.json", ApiDoc::openapi())
         )
         .mount("/api/v1", routes![add, get, get_with_password])
