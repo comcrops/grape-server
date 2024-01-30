@@ -11,10 +11,8 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
 use time::OffsetDateTime;
-use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
 #[serde(crate = "rocket::serde")]
 struct AddData {
     text: String,
@@ -27,7 +25,7 @@ struct AddData {
 enum AddResponse {
     #[response(status = 201, content_type = "json")]
     Created { url: String },
-    #[response(status = 400)]
+    #[response(status = 400, content_type = "json")]
     PasswordTooLong(&'static str),
 }
 
@@ -35,13 +33,13 @@ enum AddResponse {
 enum GetResponse {
     #[response(status = 200, content_type = "json")]
     Ok { text: String },
-    #[response(status = 401)]
+    #[response(status = 401, content_type = "json")]
     PasswordRequired(&'static str),
-    #[response(status = 404)]
+    #[response(status = 404, content_type = "json")]
     NotFound(&'static str),
-    #[response(status = 500)]
+    #[response(status = 500, content_type = "json")]
     DeletePasteError(String),
-    #[response(status = 500)]
+    #[response(status = 500, content_type = "json")]
     ParseError(String),
 }
 
@@ -49,17 +47,17 @@ enum GetResponse {
 enum GetWithPasswordResponse {
     #[response(status = 200, content_type = "json")]
     Ok { text: String },
-    #[response(status = 401)]
+    #[response(status = 401, content_type = "json")]
     PasswordIncorrect(&'static str),
-    #[response(status = 404)]
+    #[response(status = 404, content_type = "json")]
     NotFound(&'static str),
-    #[response(status = 500)]
+    #[response(status = 500, content_type = "json")]
     DeletePasteError(String),
-    #[response(status = 500)]
+    #[response(status = 500, content_type = "json")]
     ParseError(String),
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize)]
 #[serde(crate = "rocket::serde")]
 struct PasswordBody {
     password: String,
@@ -93,22 +91,6 @@ async fn main() -> Result<(), rocket::Error> {
         .await
         .expect("Failed to connect to database");
 
-    #[derive(OpenApi)]
-    #[openapi(
-        paths(
-            add,
-            get,
-            get_with_password,
-        ),
-        components(
-            schemas(
-                AddData,
-                PasswordBody,
-            ),
-        ),
-    )]
-    struct ApiDoc;
-
     let cors = CorsOptions::default()
         .allowed_origins(AllowedOrigins::all())
         .allowed_methods(
@@ -121,9 +103,6 @@ async fn main() -> Result<(), rocket::Error> {
 
     let _rocket = rocket::build()
         .manage(db_pool)
-        .mount("/",
-            SwaggerUi::new("/docs/<_..>").url("/api/v1/openapi.json", ApiDoc::openapi())
-        )
         .mount("/api/v1", routes![add, get, get_with_password])
         .attach(cors.to_cors().unwrap())
         .launch()
@@ -132,7 +111,6 @@ async fn main() -> Result<(), rocket::Error> {
     Ok(())
 }
 
-#[utoipa::path(post, path = "/add")]
 #[post("/add", data = "<body>")]
 async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> AddResponse {
     let body = body.0;
@@ -176,7 +154,6 @@ async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> AddResponse {
     AddResponse::Created { url }
 }
 
-#[utoipa::path(get, path = "/{url}")]
 #[get("/<url>")]
 async fn get(url: &str, db: &State<Pool<Postgres>>) -> GetResponse {
     let paste = match sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
@@ -204,7 +181,6 @@ async fn get(url: &str, db: &State<Pool<Postgres>>) -> GetResponse {
     }
 }
 
-#[utoipa::path(post, path = "/{url}")]
 #[post("/<url>", data = "<body>")]
 async fn get_with_password(
     url: &str,
