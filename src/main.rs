@@ -5,8 +5,8 @@ use rocket::http::Method;
 use rocket::serde::json::Json;
 use rocket::serde::Deserialize;
 use rocket::time::PrimitiveDateTime;
-use rocket::{State, Responder, post, routes, get};
-use rocket_cors::{CorsOptions, AllowedOrigins};
+use rocket::{get, post, routes, Responder, State};
+use rocket_cors::{AllowedOrigins, CorsOptions};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
@@ -14,18 +14,35 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Deserialize)]
 #[serde(crate = "rocket::serde")]
-struct AddData {
+struct Paste {
+    url: String,
     text: String,
+    /// WARN: Be aware! Will not work after `9999-12-31T23:59:59.999Z`
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+    nonce: Option<Vec<u8>>,
+    burn_after_read: bool,
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct AddRequest {
+    text: String,
+    /// WARN: Be aware! Will not work after `9999-12-31T23:59:59.999Z`
+    #[serde(with = "time::serde::rfc3339")]
+    expiring_date: OffsetDateTime,
+    burn_after_read: bool,
     password: Option<String>,
     url: Option<String>,
-    expiring_date: Option<OffsetDateTime>,
 }
+
 
 #[derive(Responder)]
 enum AddResponse {
     #[response(status = 201, content_type = "json")]
     Created { url: String },
-    #[response(status = 400, content_type = "json")]
+    #[response(status = 400)]
     PasswordTooLong(&'static str),
 }
 
@@ -33,13 +50,17 @@ enum AddResponse {
 enum GetResponse {
     #[response(status = 200, content_type = "json")]
     Ok { text: String },
-    #[response(status = 401, content_type = "json")]
+    #[response(status = 410)]
+    PasteExpired(&'static str),
+    #[response(status = 410)]
+    AlreadyRead(&'static str),
+    #[response(status = 401)]
     PasswordRequired(&'static str),
-    #[response(status = 404, content_type = "json")]
+    #[response(status = 404)]
     NotFound(&'static str),
-    #[response(status = 500, content_type = "json")]
+    #[response(status = 500)]
     DeletePasteError(String),
-    #[response(status = 500, content_type = "json")]
+    #[response(status = 500)]
     ParseError(String),
 }
 
@@ -47,14 +68,30 @@ enum GetResponse {
 enum GetWithPasswordResponse {
     #[response(status = 200, content_type = "json")]
     Ok { text: String },
-    #[response(status = 401, content_type = "json")]
+    #[response(status = 410)]
+    PasteExpired(&'static str),
+    #[response(status = 401)]
     PasswordIncorrect(&'static str),
-    #[response(status = 404, content_type = "json")]
+    #[response(status = 404)]
     NotFound(&'static str),
-    #[response(status = 500, content_type = "json")]
+    #[response(status = 500)]
     DeletePasteError(String),
-    #[response(status = 500, content_type = "json")]
+    #[response(status = 500)]
     ParseError(String),
+}
+
+impl From<GetResponse> for GetWithPasswordResponse {
+    fn from(response: GetResponse) -> Self {
+        match response {
+            GetResponse::Ok { text } => GetWithPasswordResponse::Ok { text },
+            GetResponse::PasteExpired(err) => GetWithPasswordResponse::PasteExpired(err),
+            GetResponse::AlreadyRead(err) => GetWithPasswordResponse::PasteExpired(err),
+            GetResponse::PasswordRequired(err) => GetWithPasswordResponse::PasswordIncorrect(err),
+            GetResponse::NotFound(err) => GetWithPasswordResponse::NotFound(err),
+            GetResponse::DeletePasteError(err) => GetWithPasswordResponse::DeletePasteError(err),
+            GetResponse::ParseError(err) => GetWithPasswordResponse::ParseError(err),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,14 +149,11 @@ async fn main() -> Result<(), rocket::Error> {
 }
 
 #[post("/add", data = "<body>")]
-async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> AddResponse {
+async fn add(body: Json<AddRequest>, db: &State<Pool<Postgres>>) -> AddResponse {
     let body = body.0;
 
-    let expiring_date = match body.expiring_date {
-        Some(date) => Some(PrimitiveDateTime::new(date.date(), date.time())),
-        None => None,
-    };
-
+    let expiring_date =
+        PrimitiveDateTime::new(body.expiring_date.date(), body.expiring_date.time());
     let url = body.url.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let mut nonce: Option<Vec<u8>> = None;
@@ -140,12 +174,13 @@ async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> AddResponse {
     };
 
     sqlx::query!(
-        r#"INSERT INTO paste (text, password, url, expires_at, nonce) VALUES ($1, $2, $3, $4, $5)"#,
+        r#"INSERT INTO paste (text, password, url, expires_at, nonce, burn_after_read) VALUES ($1, $2, $3, $4, $5, $6)"#,
         text,
         hashed_password,
         url,
         expiring_date,
-        nonce
+        nonce,
+        body.burn_after_read
     )
     .execute(&**db)
     .await
@@ -156,29 +191,16 @@ async fn add(body: Json<AddData>, db: &State<Pool<Postgres>>) -> AddResponse {
 
 #[get("/<url>")]
 async fn get(url: &str, db: &State<Pool<Postgres>>) -> GetResponse {
-    let paste = match sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
-        .fetch_one(&**db)
-        .await
-    {
+    let paste = match get_and_check_paste(url, db).await {
         Ok(paste) => paste,
-        Err(_) => return GetResponse::NotFound("Paste not found"),
+        Err(err) => return err,
     };
-
-    if paste.expires_at.is_some() {
-        match delete_paste_if_expired(paste.url, paste.expires_at.unwrap(), &paste.text, db).await {
-            Ok(_) => {}
-            Err(err) => return GetResponse::DeletePasteError(err.to_string()),
-        }
-    }
 
     if paste.password.is_some() {
         return GetResponse::PasswordRequired("Password is required");
     }
 
-    match String::from_utf8(paste.text) {
-        Ok(text) => GetResponse::Ok { text },
-        Err(err) => GetResponse::ParseError(err.to_string()),
-    }
+    GetResponse::Ok { text: paste.text }
 }
 
 #[post("/<url>", data = "<body>")]
@@ -187,31 +209,13 @@ async fn get_with_password(
     body: Json<PasswordBody>,
     db: &State<Pool<Postgres>>,
 ) -> GetWithPasswordResponse {
-    let paste = match sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
-        .fetch_one(&**db)
-        .await
-    {
+    let paste = match get_and_check_paste(url, db).await {
         Ok(paste) => paste,
-        Err(_) => return GetWithPasswordResponse::NotFound("Paste not found"),
+        Err(err) => return err.into(),
     };
 
-    if paste.expires_at.is_some() {
-        match delete_paste_if_expired(paste.url, paste.expires_at.unwrap(), &paste.text, db).await {
-            Ok(_) => {}
-            Err(err) => return GetWithPasswordResponse::DeletePasteError(err.to_string()),
-        }
-    }
-
-    /// Defer would be so nice here
-    fn parse_text(text: Vec<u8>) -> GetWithPasswordResponse {
-        match String::from_utf8(text) {
-            Ok(text) => GetWithPasswordResponse::Ok { text },
-            Err(err) => GetWithPasswordResponse::ParseError(err.to_string()),
-        }
-    }
-
     if paste.password.is_none() {
-        return parse_text(paste.text);
+        return GetWithPasswordResponse::Ok { text: paste.text };
     }
 
     let hashed_password = hash_password(&body.password.clone());
@@ -219,31 +223,72 @@ async fn get_with_password(
         return GetWithPasswordResponse::PasswordIncorrect("Password is incorrect");
     }
 
-    let text = decrypt_text(&paste.text, &body.password, &paste.nonce.unwrap());
-    parse_text(text)
+    let text = match String::from_utf8(decrypt_text(&paste.text.as_bytes(), &body.password, &paste.nonce.unwrap())) {
+        Ok(text) => text,
+        Err(err) => return GetWithPasswordResponse::ParseError(err.to_string()),
+    };
+
+    GetWithPasswordResponse::Ok { text }
 }
 
-async fn delete_paste_if_expired(
-    url: String,
-    expires_at: PrimitiveDateTime,
-    text: &Vec<u8>,
-    db: &State<Pool<Postgres>>,
-) -> Result<(), DeletePasteError> {
+async fn get_and_check_paste(url: &str, db: &Pool<Postgres>) -> Result<Paste, GetResponse> {
+    let paste = match sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
+        .fetch_one(db)
+        .await
+    {
+        Ok(paste) => paste,
+        Err(_) => return Err(GetResponse::NotFound("Paste not found")),
+    };
+
     let now = OffsetDateTime::now_utc();
     let now = PrimitiveDateTime::new(now.date(), now.time());
 
-    if expires_at < now {
-        if text.len() > 0 {
-            let result = sqlx::query!(
-                r#"UPDATE paste SET text='', password=NULL, nonce=NULL, burn_after_read=false WHERE url=$1"#,
-                url
-            )
-                .execute(&**db)
-                .await;
-            if result.is_err() {
-                return Err(DeletePasteError { expired_url: url });
+    if paste.expires_at < now {
+        if paste.text.len() > 0 {
+            match delete_paste(url, db).await {
+                Ok(_) => return Err(GetResponse::PasteExpired("Paste expired")),
+                Err(err) => return Err(GetResponse::DeletePasteError(err.to_string())),
             }
         }
+    }
+
+    if paste.burn_after_read {
+        if paste.text.len() == 0 {
+            return Err(GetResponse::AlreadyRead("Paste was already read"));
+        }
+        match delete_paste(url, db).await {
+            Ok(_) => {}
+            Err(err) => return Err(GetResponse::DeletePasteError(err.to_string())),
+        }
+    }
+
+    let text = match String::from_utf8(paste.text) {
+        Ok(text) => text,
+        Err(err) => return Err(GetResponse::ParseError(err.to_string())),
+    };
+
+    Ok(Paste {
+        text,
+        expires_at: OffsetDateTime::new_utc(paste.expires_at.date(), paste.expires_at.time()),
+        burn_after_read: paste.burn_after_read,
+        password: paste.password,
+        url: paste.url,
+        nonce: paste.nonce,
+    })
+}
+
+async fn delete_paste(url: &str, db: &Pool<Postgres>) -> Result<(), DeletePasteError> {
+    let result = sqlx::query!(
+                r#"UPDATE paste SET text='', password=NULL, nonce=NULL WHERE url=$1"#,
+                url
+            )
+                .execute(db)
+                .await;
+
+    if result.is_err() {
+        return Err(DeletePasteError {
+            expired_url: url.to_owned(),
+        });
     }
 
     Ok(())
