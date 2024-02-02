@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 #[serde(crate = "rocket::serde")]
 struct Paste {
     url: String,
-    text: String,
+    text: Vec<u8>,
     /// WARN: Be aware! Will not work after `9999-12-31T23:59:59.999Z`
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
@@ -70,6 +70,8 @@ enum GetWithPasswordResponse {
     Ok { text: String },
     #[response(status = 410)]
     PasteExpired(&'static str),
+    #[response(status = 410)]
+    AlreadyRead(&'static str),
     #[response(status = 401)]
     PasswordIncorrect(&'static str),
     #[response(status = 404)]
@@ -78,6 +80,8 @@ enum GetWithPasswordResponse {
     DeletePasteError(String),
     #[response(status = 500)]
     ParseError(String),
+    #[response(status = 500)]
+    InternalServerError(&'static str),
 }
 
 impl From<GetResponse> for GetWithPasswordResponse {
@@ -85,11 +89,11 @@ impl From<GetResponse> for GetWithPasswordResponse {
         match response {
             GetResponse::Ok { text } => GetWithPasswordResponse::Ok { text },
             GetResponse::PasteExpired(err) => GetWithPasswordResponse::PasteExpired(err),
-            GetResponse::AlreadyRead(err) => GetWithPasswordResponse::PasteExpired(err),
-            GetResponse::PasswordRequired(err) => GetWithPasswordResponse::PasswordIncorrect(err),
+            GetResponse::AlreadyRead(err) => GetWithPasswordResponse::AlreadyRead(err),
             GetResponse::NotFound(err) => GetWithPasswordResponse::NotFound(err),
             GetResponse::DeletePasteError(err) => GetWithPasswordResponse::DeletePasteError(err),
             GetResponse::ParseError(err) => GetWithPasswordResponse::ParseError(err),
+            _ => GetWithPasswordResponse::InternalServerError("Converting from GetResponse failed"),
         }
     }
 }
@@ -200,7 +204,22 @@ async fn get(url: &str, db: &State<Pool<Postgres>>) -> GetResponse {
         return GetResponse::PasswordRequired("Password is required");
     }
 
-    GetResponse::Ok { text: paste.text }
+    if paste.burn_after_read {
+        if paste.text.len() == 0 {
+            return GetResponse::AlreadyRead("Paste was already read");
+        }
+        match delete_paste(url, db).await {
+            Ok(_) => {}
+            Err(err) => return GetResponse::DeletePasteError(err.to_string()),
+        }
+    }
+
+    let text = match String::from_utf8(paste.text) {
+        Ok(text) => text,
+        Err(err) => return GetResponse::ParseError(err.to_string()),
+    };
+
+    GetResponse::Ok { text }
 }
 
 #[post("/<url>", data = "<body>")]
@@ -214,8 +233,22 @@ async fn get_with_password(
         Err(err) => return err.into(),
     };
 
+    if paste.burn_after_read {
+        if paste.text.len() == 0 {
+            return GetWithPasswordResponse::AlreadyRead("Paste was already read");
+        }
+        match delete_paste(url, db).await {
+            Ok(_) => {}
+            Err(err) => return GetWithPasswordResponse::DeletePasteError(err.to_string()),
+        }
+    }
+
     if paste.password.is_none() {
-        return GetWithPasswordResponse::Ok { text: paste.text };
+        let text = match String::from_utf8(paste.text) {
+            Ok(text) => text,
+            Err(err) => return GetWithPasswordResponse::ParseError(err.to_string()),
+        };
+        return GetWithPasswordResponse::Ok { text };
     }
 
     let hashed_password = hash_password(&body.password.clone());
@@ -223,7 +256,7 @@ async fn get_with_password(
         return GetWithPasswordResponse::PasswordIncorrect("Password is incorrect");
     }
 
-    let text = match String::from_utf8(decrypt_text(&paste.text.as_bytes(), &body.password, &paste.nonce.unwrap())) {
+    let text = match String::from_utf8(decrypt_text(&paste.text, &body.password, &paste.nonce.unwrap())) {
         Ok(text) => text,
         Err(err) => return GetWithPasswordResponse::ParseError(err.to_string()),
     };
@@ -252,23 +285,8 @@ async fn get_and_check_paste(url: &str, db: &Pool<Postgres>) -> Result<Paste, Ge
         }
     }
 
-    if paste.burn_after_read {
-        if paste.text.len() == 0 {
-            return Err(GetResponse::AlreadyRead("Paste was already read"));
-        }
-        match delete_paste(url, db).await {
-            Ok(_) => {}
-            Err(err) => return Err(GetResponse::DeletePasteError(err.to_string())),
-        }
-    }
-
-    let text = match String::from_utf8(paste.text) {
-        Ok(text) => text,
-        Err(err) => return Err(GetResponse::ParseError(err.to_string())),
-    };
-
     Ok(Paste {
-        text,
+        text: paste.text,
         expires_at: OffsetDateTime::new_utc(paste.expires_at.date(), paste.expires_at.time()),
         burn_after_read: paste.burn_after_read,
         password: paste.password,
