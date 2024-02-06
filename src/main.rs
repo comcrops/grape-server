@@ -362,6 +362,9 @@ async fn url_exists(url: &str, db: &Pool<Postgres>) -> bool {
         .fetch_optional(db)
         .await;
 
-    result.is_ok()
+    match result {
+        Ok(value) => value.is_some(),
+        Err(_) => false,
+    }
 }
 
