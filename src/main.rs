@@ -37,13 +37,14 @@ struct AddRequest {
     url: Option<String>,
 }
 
-
 #[derive(Responder)]
 enum AddResponse {
     #[response(status = 201, content_type = "json")]
     Created { url: String },
     #[response(status = 400)]
     PasswordTooLong(&'static str),
+    #[response(status = 409)]
+    UrlAlreadyExists(&'static str),
 }
 
 #[derive(Responder)]
@@ -156,6 +157,10 @@ async fn main() -> Result<(), rocket::Error> {
 async fn add(body: Json<AddRequest>, db: &State<Pool<Postgres>>) -> AddResponse {
     let body = body.0;
 
+    if body.url.is_some() && url_exists(&body.url.to_owned().unwrap(), db).await {
+        return AddResponse::UrlAlreadyExists("URL already exists");
+    }
+
     let expiring_date =
         PrimitiveDateTime::new(body.expiring_date.date(), body.expiring_date.time());
     let url = body.url.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -256,7 +261,11 @@ async fn get_with_password(
         return GetWithPasswordResponse::PasswordIncorrect("Password is incorrect");
     }
 
-    let text = match String::from_utf8(decrypt_text(&paste.text, &body.password, &paste.nonce.unwrap())) {
+    let text = match String::from_utf8(decrypt_text(
+        &paste.text,
+        &body.password,
+        &paste.nonce.unwrap(),
+    )) {
         Ok(text) => text,
         Err(err) => return GetWithPasswordResponse::ParseError(err.to_string()),
     };
@@ -297,11 +306,11 @@ async fn get_and_check_paste(url: &str, db: &Pool<Postgres>) -> Result<Paste, Ge
 
 async fn delete_paste(url: &str, db: &Pool<Postgres>) -> Result<(), DeletePasteError> {
     let result = sqlx::query!(
-                r#"UPDATE paste SET text='', password=NULL, nonce=NULL WHERE url=$1"#,
-                url
-            )
-                .execute(db)
-                .await;
+        r#"UPDATE paste SET text='', password=NULL, nonce=NULL WHERE url=$1"#,
+        url
+    )
+    .execute(db)
+    .await;
 
     if result.is_err() {
         return Err(DeletePasteError {
@@ -347,3 +356,12 @@ fn generate_cipher_from_password(password: &str) -> Aes256Gcm {
 fn hash_password(password: &str) -> String {
     format!("{:X}", Sha256::digest(password))
 }
+
+async fn url_exists(url: &str, db: &Pool<Postgres>) -> bool {
+    let result = sqlx::query!(r#"SELECT * FROM paste WHERE url=$1"#, url)
+        .fetch_optional(db)
+        .await;
+
+    result.is_ok()
+}
+
